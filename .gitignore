@@ -1,0 +1,8 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Cursor workspace config (kept private, not shared on GitHub)
+.cursor/
