@@ -47,6 +47,7 @@ import {
   buildMirroredSplat,
   mirrorAllSplats,
   keepSourceSide,
+  keepMirrorSide,
   reflectAllSourceSide,
   concatSplats,
   applyTransform,
@@ -156,10 +157,18 @@ const mirrorClipEdit = new SplatEdit({
   sdfs: [clipSdf],
 });
 
-// ----- Splat group (gizmo target; holds the original SplatMesh) -----
-const splatGroup = new THREE.Group();
-scene.add(splatGroup);
-splatGroup.add(new THREE.AxesHelper(0.3));
+// ----- Splat groups (gizmo targets) -----
+// splatGroupA owns the SOURCE-side mesh (originalMesh).
+const splatGroupA = new THREE.Group();
+scene.add(splatGroupA);
+splatGroupA.add(new THREE.AxesHelper(0.3));
+
+// splatGroupB is a transform-only anchor for the MIRROR-side splat (B). It
+// has no children. Each frame we compute mirrorMesh's manual matrix from
+// either splatGroupB.matrixWorld (when slot B is loaded) or from the
+// auto-mirror of splatGroupA (when no B is loaded).
+const splatGroupB = new THREE.Group();
+scene.add(splatGroupB);
 
 // ----- State -----
 // Slot A: the SOURCE-side splat (always required to render anything).
@@ -195,7 +204,8 @@ const gizmo = new TransformControls(camera, canvas);
 gizmo.size = 0.8;
 const gizmoHelper = gizmo.getHelper ? gizmo.getHelper() : gizmo;
 scene.add(gizmoHelper);
-gizmo.attach(splatGroup);
+gizmo.attach(splatGroupA);
+let currentGizmoTarget = "a";
 gizmo.addEventListener("dragging-changed", (e) => {
   // While the user is dragging a gizmo handle, suspend whichever camera
   // controller owns the mouse so its drag doesn't fight the gizmo's drag.
@@ -214,9 +224,11 @@ gizmo.addEventListener("dragging-changed", (e) => {
 const ui = createUI({
   onChange: (state) => applyUIState(state),
   onResetSplat: () => {
-    splatGroup.position.set(0, 0, 0);
-    splatGroup.quaternion.set(0, 0, 0, 1);
-    splatGroup.scale.set(1, 1, 1);
+    // Reset whichever group the gizmo is currently editing.
+    const target = ui.state.editTarget === "b" ? splatGroupB : splatGroupA;
+    target.position.set(0, 0, 0);
+    target.quaternion.set(0, 0, 0, 1);
+    target.scale.set(1, 1, 1);
   },
   onDownload: handleDownload,
   onLoadFile: async (slot, file) => {
@@ -289,6 +301,16 @@ function applyUIState(state) {
   flyControls.fpsMovement.moveSpeed = state.flySpeed;
   flyControls.pointerControls.enable = fly;
 
+  // Edit target — attach the gizmo to whichever splat group the UI selects.
+  // (Falls back to A if the user picked B but B isn't loaded.)
+  const targetName =
+    state.editTarget === "b" && splatB ? "b" : "a";
+  if (targetName !== currentGizmoTarget) {
+    gizmo.detach();
+    gizmo.attach(targetName === "b" ? splatGroupB : splatGroupA);
+    currentGizmoTarget = targetName;
+  }
+
   // Gizmo mode — available in both orbit and fly. While flying, the
   // dragging-changed handler temporarily pauses fly's mouse-look so you can
   // drag the handle without the camera spinning.
@@ -312,14 +334,37 @@ function computeReflectWorld(axisIdx, offset) {
   e[12 + axisIdx] = 2 * offset;
 }
 
-// Mirror mesh's world matrix updates each frame from the gizmo + plane state.
-// Also updates any radial-symmetry copies, applying a Y-axis rotation per copy
-// before the same reflection math.
+// When slot B is empty, splatGroupB auto-tracks the mirror of A so the
+// mirror-side mesh follows A's gizmo (original single-splat behaviour).
+// The matrix being decomposed has det = +1 (two reflections cancel), so it
+// decomposes cleanly into a positive-scale transform — no negative scale on
+// splatGroupB, which keeps the gizmo behaving normally if the user later
+// loads a B and starts editing it.
+const _autoSyncMat = new THREE.Matrix4();
+function autoSyncSplatGroupBToA() {
+  splatGroupA.updateMatrixWorld(true);
+  _autoSyncMat.multiplyMatrices(reflectWorld, splatGroupA.matrixWorld);
+  _autoSyncMat.multiply(reflectLocal);
+  _autoSyncMat.decompose(
+    splatGroupB.position,
+    splatGroupB.quaternion,
+    splatGroupB.scale,
+  );
+  splatGroupB.updateMatrixWorld(true);
+}
+
+// Mirror mesh's world matrix updates each frame from splatGroupB's current
+// transform. The mirror mesh's data is pre-X-reflected (mirrorAllSplats), so
+// rendering it through splatGroupB.matrixWorld · Reflect_local cancels the
+// data's pre-flip and applies splatGroupB's user transform to the original B
+// data — i.e. user manipulates B in its natural orientation.
 function updateMirrorTransform() {
   if (!mirrorMesh) return;
-  splatGroup.updateMatrixWorld(true);
-  tmpMatrix.multiplyMatrices(reflectWorld, splatGroup.matrixWorld);
-  tmpMatrix.multiply(reflectLocal);
+  if (!splatB) autoSyncSplatGroupBToA();
+  splatGroupB.updateMatrixWorld(true);
+
+  // mirrorMesh matrix = splatGroupB.matrixWorld · Reflect_local
+  tmpMatrix.copy(splatGroupB.matrixWorld).multiply(reflectLocal);
   mirrorMesh.matrix.copy(tmpMatrix);
   mirrorMesh.matrixWorldNeedsUpdate = true;
 
@@ -330,13 +375,15 @@ function updateMirrorTransform() {
     const angle = ((i + 1) * 2 * Math.PI) / totalCount;
     tmpRotY.makeRotationY(angle);
 
-    // Original radial copy: RotY(angle) * splatGroup.matrixWorld
-    radialOriginals[i].matrix.multiplyMatrices(tmpRotY, splatGroup.matrixWorld);
+    // Source radial copy: RotY(angle) · splatGroupA.matrixWorld
+    radialOriginals[i].matrix.multiplyMatrices(
+      tmpRotY,
+      splatGroupA.matrixWorld,
+    );
     radialOriginals[i].matrixWorldNeedsUpdate = true;
 
-    // Mirror radial copy: reflectWorld * RotY(angle) * splatGroup.matrixWorld * reflectLocal
-    tmpMatrix.multiplyMatrices(reflectWorld, tmpRotY);
-    tmpMatrix.multiply(splatGroup.matrixWorld);
+    // Mirror radial copy: RotY(angle) · splatGroupB.matrixWorld · Reflect_local
+    tmpMatrix.multiplyMatrices(tmpRotY, splatGroupB.matrixWorld);
     tmpMatrix.multiply(reflectLocal);
     radialMirrors[i].matrix.copy(tmpMatrix);
     radialMirrors[i].matrixWorldNeedsUpdate = true;
@@ -440,7 +487,7 @@ function activeMirrorPacked() {
 // used by the slot loaders to avoid duplicating dispose logic).
 function disposeOriginalMeshes() {
   if (originalMesh) {
-    splatGroup.remove(originalMesh);
+    splatGroupA.remove(originalMesh);
     originalMesh.dispose?.();
     originalMesh = null;
   }
@@ -472,7 +519,7 @@ async function buildOriginalMesh() {
   originalMesh.editable = true;
   originalMesh.edits = [originalClipEdit];
   await originalMesh.initialized;
-  splatGroup.add(originalMesh);
+  splatGroupA.add(originalMesh);
 }
 
 // Build / rebuild the mirror mesh from whichever pre-reflected pack is active.
@@ -521,6 +568,7 @@ async function loadSpzIntoSlot(slot, bytes, fileName) {
     await buildMirrorMesh();
     fitPlaneBoundsFromData(splatA);
   } else {
+    const isFirstB = splatB == null;
     splatB = decoded;
     fileNameB = fileName;
 
@@ -536,12 +584,17 @@ async function loadSpzIntoSlot(slot, bytes, fileName) {
     );
     mirrorPackedB = await packFromData(mirrorAllSplats(decoded, 0, 0));
     await buildMirrorMesh();
+
+    // First-time slot-B load: splatGroupB has been auto-synced to A's
+    // mirror every frame while B was empty, so its current transform is
+    // already at the right "mirror of A" position. Nothing extra to do.
   }
 
   applyUIState(ui.state); // re-apply (recreates radial copies referencing new packs)
   updateMirrorTransform();
   ui.setSlotName("a", splatA ? fileNameA : null);
   ui.setSlotName("b", splatB ? fileNameB : null);
+  ui.setEditTargetAvailability({ aLoaded: !!splatA, bLoaded: !!splatB });
   ui.setStatus(
     `Slot ${slot.toUpperCase()} loaded: ${decoded.numPoints.toLocaleString()} splats from ${fileName}`,
   );
@@ -724,17 +777,31 @@ async function handleDownload() {
   ui.enableDownload(false);
   ui.setStatus("Applying gizmo + mirror, encoding .spz…");
   try {
-    splatGroup.updateMatrixWorld(true);
-    const baseQuat = new THREE.Quaternion();
-    splatGroup.getWorldQuaternion(baseQuat);
+    splatGroupA.updateMatrixWorld(true);
+    splatGroupB.updateMatrixWorld(true);
     const axisIdx = AXES[ui.state.axis];
     const radialCount = Math.max(1, Math.floor(ui.state.radialCount));
 
-    // For each radial slot we bake one "wedge":
-    //   - A's source-side splats at  RotY(angle) · T_gizmo
-    //   - (B if loaded, else A)'s source-side splats reflected across the
-    //     world plane (same world transform as A's wedge, then mirrored).
-    // For radialCount=1 + no B this collapses to the original behaviour.
+    // Decompose each group's matrixWorld into position/quaternion/scale so
+    // we can pass a scalar uniform-scale into applyTransform (which only
+    // supports uniform). Non-uniform scale is approximated by the average.
+    const posA = new THREE.Vector3();
+    const quatA = new THREE.Quaternion();
+    const sclA = new THREE.Vector3();
+    splatGroupA.matrixWorld.decompose(posA, quatA, sclA);
+    const sA = (sclA.x + sclA.y + sclA.z) / 3;
+    if (Math.max(sclA.x, sclA.y, sclA.z) / Math.min(sclA.x, sclA.y, sclA.z) > 1.001) {
+      ui.setStatus(
+        "Note: non-uniform scale on A — download uses the average; preview is exact.",
+      );
+    }
+
+    const posB = new THREE.Vector3();
+    const quatB = new THREE.Quaternion();
+    const sclB = new THREE.Vector3();
+    splatGroupB.matrixWorld.decompose(posB, quatB, sclB);
+    const sB = (sclB.x + sclB.y + sclB.z) / 3;
+
     const splatForMirror = splatB ?? splatA;
     if (
       splatB &&
@@ -749,40 +816,54 @@ async function handleDownload() {
     const parts = [];
     const rotMat = new THREE.Matrix4();
     const rotQuat = new THREE.Quaternion();
-    const composedMat = new THREE.Matrix4();
-    const composedQuat = new THREE.Quaternion();
+    const composedMatA = new THREE.Matrix4();
+    const composedMatB = new THREE.Matrix4();
+    const composedQuatA = new THREE.Quaternion();
+    const composedQuatB = new THREE.Quaternion();
     const Y_AXIS = new THREE.Vector3(0, 1, 0);
 
     for (let i = 0; i < radialCount; i++) {
       const angle = (i * 2 * Math.PI) / radialCount;
       rotQuat.setFromAxisAngle(Y_AXIS, angle);
       rotMat.makeRotationFromQuaternion(rotQuat);
-      composedMat.multiplyMatrices(rotMat, splatGroup.matrixWorld);
-      composedQuat.multiplyQuaternions(rotQuat, baseQuat);
-      const composedQuatArr = new Float32Array([
-        composedQuat.x,
-        composedQuat.y,
-        composedQuat.z,
-        composedQuat.w,
-      ]);
+      composedMatA.multiplyMatrices(rotMat, splatGroupA.matrixWorld);
+      composedMatB.multiplyMatrices(rotMat, splatGroupB.matrixWorld);
+      composedQuatA.multiplyQuaternions(rotQuat, quatA);
+      composedQuatB.multiplyQuaternions(rotQuat, quatB);
 
-      // A's source-side half (world-space)
+      // A: clone, apply T_A (pos+quat+uniform scale), keep source side.
       const worldA = cloneSplatData(splatA);
-      applyTransform(worldA, composedMat.elements, composedQuatArr);
+      applyTransform(
+        worldA,
+        composedMatA.elements,
+        new Float32Array([
+          composedQuatA.x,
+          composedQuatA.y,
+          composedQuatA.z,
+          composedQuatA.w,
+        ]),
+        sA,
+      );
       parts.push(
         keepSourceSide(worldA, axisIdx, ui.state.plane, ui.state.flipSide),
       );
 
-      // B's (or A's fallback) source-side half, reflected to the mirror side
-      const worldMirror = cloneSplatData(splatForMirror);
-      applyTransform(worldMirror, composedMat.elements, composedQuatArr);
+      // B: clone, pre-X-flip (matches mirrorPackedB in the live preview),
+      // apply T_B, keep mirror side. Falls back to A's data when B is empty.
+      const worldB = mirrorAllSplats(splatForMirror, 0, 0);
+      applyTransform(
+        worldB,
+        composedMatB.elements,
+        new Float32Array([
+          composedQuatB.x,
+          composedQuatB.y,
+          composedQuatB.z,
+          composedQuatB.w,
+        ]),
+        sB,
+      );
       parts.push(
-        reflectAllSourceSide(
-          worldMirror,
-          axisIdx,
-          ui.state.plane,
-          ui.state.flipSide,
-        ),
+        keepMirrorSide(worldB, axisIdx, ui.state.plane, ui.state.flipSide),
       );
     }
 

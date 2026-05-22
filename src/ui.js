@@ -13,7 +13,8 @@ export function createUI({
     plane: 0, // world units
     flipSide: false,
     showPlane: true, // toggle the translucent plane + edges visualization
-    gizmoMode: "translate", // 'translate' | 'rotate' | 'off'
+    gizmoMode: "translate", // 'translate' | 'rotate' | 'scale' | 'off'
+    editTarget: "a", // 'a' | 'b' — which splat the gizmo controls
     softEdge: 0, // total fade width across the symmetry plane, in world units
     cameraMode: "orbit", // 'orbit' | 'fly'
     flySpeed: 1, // base movement speed for the fly camera (Shift/Ctrl multipliers apply on top)
@@ -99,6 +100,19 @@ export function createUI({
       modeBtns.forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       state.gizmoMode = btn.dataset.mode;
+      emit();
+    });
+  });
+
+  // Edit target (which splat group the gizmo controls). The B button is
+  // disabled until slot B has actually loaded a splat.
+  const targetBtns = document.querySelectorAll(".target-btn");
+  targetBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.disabled) return;
+      targetBtns.forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      state.editTarget = btn.dataset.target;
       emit();
     });
   });
@@ -231,6 +245,28 @@ export function createUI({
     },
     setSlotName(slot, name) {
       renderSlotName(slot === "a" ? slotANameEl : slotBNameEl, name);
+    },
+    // Enable/disable the "Edit B" button based on whether slot B is loaded.
+    // If B becomes unavailable while it was the active target, fall back to A.
+    setEditTargetAvailability({ aLoaded, bLoaded }) {
+      const aBtn = document.querySelector('.target-btn[data-target="a"]');
+      const bBtn = document.querySelector('.target-btn[data-target="b"]');
+      if (aBtn) aBtn.disabled = !aLoaded;
+      if (bBtn) bBtn.disabled = !bLoaded;
+      if (!bLoaded && state.editTarget === "b") {
+        state.editTarget = "a";
+        targetBtns.forEach((b) =>
+          b.classList.toggle("active", b.dataset.target === "a"),
+        );
+        emit();
+      }
+      if (!aLoaded && state.editTarget === "a" && bLoaded) {
+        state.editTarget = "b";
+        targetBtns.forEach((b) =>
+          b.classList.toggle("active", b.dataset.target === "b"),
+        );
+        emit();
+      }
     },
   };
 }
