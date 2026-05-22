@@ -79,20 +79,24 @@
         </div>
       </details>
 
-      <section class="group">
-        <label class="group-label">Camera</label>
-        <div class="axis-buttons" role="radiogroup" aria-label="Camera mode">
-          <button class="cam-btn active" data-camera="orbit">Orbit</button>
-          <button class="cam-btn" data-camera="fly">Fly</button>
+      <details class="accordion">
+        <summary>Camera</summary>
+        <div class="accordion-body">
+          <section class="group">
+            <div class="axis-buttons" role="radiogroup" aria-label="Camera mode">
+              <button class="cam-btn active" data-camera="orbit">Orbit</button>
+              <button class="cam-btn" data-camera="fly">Fly</button>
+            </div>
+            <p class="hint" id="fly-hint" style="display: none">
+              <strong>Fly mode:</strong> <code>W A S D</code> or arrow keys to
+              move, drag mouse to look around, scroll to move forward/back.
+              <code>Shift</code> goes faster, <code>Ctrl</code> goes slower.
+              Grab a gizmo arrow to move the splat — mouse-look pauses while
+              you drag.
+            </p>
+          </section>
         </div>
-        <p class="hint" id="fly-hint" style="display: none">
-          <strong>Fly mode:</strong> <code>W A S D</code> or arrow keys to
-          move, drag mouse to look around, scroll to move forward/back.
-          <code>Shift</code> goes faster, <code>Ctrl</code> goes slower.
-          Grab a gizmo arrow to move the splat — mouse-look pauses while you
-          drag.
-        </p>
-      </section>
+      </details>
 
       <section class="group">
         <label class="group-label">Gizmo</label>
