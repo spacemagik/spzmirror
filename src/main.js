@@ -31,8 +31,6 @@ import { TransformControls } from "three/addons/controls/TransformControls.js";
 import {
   SparkRenderer,
   SplatMesh,
-  PackedSplats,
-  setPackedSplat,
   SplatEdit,
   SplatEditSdf,
   SplatEditSdfType,
@@ -41,7 +39,7 @@ import {
 } from "@sparkjsdev/spark";
 
 import { createUI } from "./ui.js";
-import { decodeSpz, SH_C0 } from "./spz-decode.js";
+import { decodeSpz } from "./spz-decode.js";
 import { encodeSpz } from "./spz-encode.js";
 import {
   buildMirroredSplat,
@@ -56,12 +54,22 @@ import {
 
 // ----- Scene -----
 const canvas = document.getElementById("viewport");
+// NOTE on antialias: Gaussian splats already render as smooth 2D gaussians
+// (Spark fades each splat's alpha at its edge), so MSAA at the renderer
+// level only marginally cleans up the hard cull edge while costing 2-4x
+// fragment work at retina DPRs. Splat-heavy scenes run much smoother with
+// MSAA off. The helper grid still looks fine because the SparkRenderer's
+// own resolve pass is what we're seeing through.
 const renderer = new THREE.WebGLRenderer({
   canvas,
   antialias: false,
   powerPreference: "high-performance",
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// Cap pixel ratio at 1.5: splat rendering is fragment-bound, and DPR 2 on a
+// retina display means rendering 4x the pixels of a 1x display for very
+// little perceptual gain on splats (the per-splat gaussian already softens
+// edges). 1.5 keeps text/UI crisp without doubling the splat fill cost.
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x0b0c10, 1);
 
@@ -172,17 +180,16 @@ scene.add(splatGroupB);
 
 // ----- State -----
 // Slot A: the SOURCE-side splat (always required to render anything).
-let splatA = null; // decoded original of A
-let packedA = null; // GPU-packed copy of A used for the original mesh + radial originals
-let mirrorPackedA = null; // pre-reflected (local-X) copy of A — used as the mirror twin when no B is loaded
+let splatA = null; // decoded original of A (needed for mirror math + download)
+let mirrorBytesA = null; // re-encoded .spz bytes for A's pre-reflected twin
 let fileNameA = "splat.spz";
 
 // Slot B: an OPTIONAL second splat that replaces A's mirror twin.
 let splatB = null; // decoded splat for slot B (null if not loaded)
-let mirrorPackedB = null; // pre-reflected (local-X) copy of B — used as the mirror twin when B is loaded
+let mirrorBytesB = null; // re-encoded .spz bytes for B's pre-reflected twin
 let fileNameB = null;
 
-// Meshes (recreated as needed when packs change).
+// Meshes (recreated as needed when slot data changes).
 let originalMesh = null;
 let mirrorMesh = null;
 
@@ -411,11 +418,15 @@ function rebuildRadialMeshes(count) {
     m.dispose?.();
   }
 
-  if (!packedA || !activeMirrorPacked()) return;
+  // Share the GPU-resident PackedSplats from the primary meshes — we just
+  // want extra rotated copies, not extra data.
+  const srcPacked = originalMesh?.packedSplats;
+  const mirrorPacked = mirrorMesh?.packedSplats;
+  if (!srcPacked || !mirrorPacked) return;
 
   // Add extras to reach desired count
   while (radialOriginals.length < desiredExtras) {
-    const o = new SplatMesh({ packedSplats: packedA });
+    const o = new SplatMesh({ packedSplats: srcPacked });
     o.editable = true;
     o.edits = [originalClipEdit];
     o.matrixAutoUpdate = false;
@@ -423,7 +434,7 @@ function rebuildRadialMeshes(count) {
     radialOriginals.push(o);
   }
   while (radialMirrors.length < desiredExtras) {
-    const m = new SplatMesh({ packedSplats: activeMirrorPacked() });
+    const m = new SplatMesh({ packedSplats: mirrorPacked });
     m.editable = true;
     m.edits = [mirrorClipEdit];
     m.matrixAutoUpdate = false;
@@ -432,40 +443,20 @@ function rebuildRadialMeshes(count) {
   }
 }
 
-// ----- Splat data → PackedSplats -----
-async function packFromData(data) {
-  const ps = new PackedSplats({ maxSplats: Math.max(data.numPoints, 1) });
-  await ps.initialized;
-  ps.ensureSplats(data.numPoints);
-  for (let i = 0; i < data.numPoints; i++) {
-    const i3 = i * 3;
-    const i4 = i * 4;
-    setPackedSplat(
-      ps.packedArray,
-      i,
-      data.positions[i3 + 0],
-      data.positions[i3 + 1],
-      data.positions[i3 + 2],
-      data.scales[i3 + 0],
-      data.scales[i3 + 1],
-      data.scales[i3 + 2],
-      data.rotations[i4 + 0],
-      data.rotations[i4 + 1],
-      data.rotations[i4 + 2],
-      data.rotations[i4 + 3],
-      data.alphas[i],
-      clamp01(data.colors[i3 + 0] * SH_C0 + 0.5),
-      clamp01(data.colors[i3 + 1] * SH_C0 + 0.5),
-      clamp01(data.colors[i3 + 2] * SH_C0 + 0.5),
-    );
-  }
-  ps.numSplats = data.numPoints;
-  ps.needsUpdate = true;
-  return ps;
-}
-
-function clamp01(v) {
-  return v < 0 ? 0 : v > 1 ? 1 : v;
+// ----- .spz bytes → SplatMesh (native Spark loader) -----
+//
+// Spark's SplatMesh accepts raw .spz bytes via { fileBytes, fileType }. We use
+// this path for ALL meshes (originals + mirrors + radial copies) so the splats
+// are rendered through Spark's high-precision internal decoder. The previous
+// approach (decode → setPackedSplat per splat) re-quantized the data twice
+// and visibly degraded quality — see the use-spark rule in .cursor/rules/.
+async function buildSplatMeshFromSpzBytes(bytes) {
+  const mesh = new SplatMesh({
+    fileBytes: bytes,
+    fileType: "spz",
+  });
+  await mesh.initialized;
+  return mesh;
 }
 
 // ----- .spz loading -----
@@ -478,15 +469,13 @@ async function loadSpzFromUrl(url) {
   await loadSpzIntoSlot("a", buf, fileName);
 }
 
-// Return whichever pre-reflected packed splat should currently feed the
-// mirror-side mesh (and the radial mirror copies): B's if loaded, A's
-// otherwise.
-function activeMirrorPacked() {
-  return mirrorPackedB ?? mirrorPackedA;
+// Return whichever pre-reflected .spz bytes should currently feed the mirror
+// mesh (and its radial copies): B's if loaded, A's otherwise.
+function activeMirrorBytes() {
+  return mirrorBytesB ?? mirrorBytesA;
 }
 
-// Tear down the original mesh + any radial source-side copies (cheap helpers
-// used by the slot loaders to avoid duplicating dispose logic).
+// Tear down the original mesh + any radial source-side copies.
 function disposeOriginalMeshes() {
   if (originalMesh) {
     splatGroupA.remove(originalMesh);
@@ -513,27 +502,28 @@ function disposeMirrorMeshes() {
   radialMirrors = [];
 }
 
-// Build / rebuild the original mesh from the currently-loaded packedA.
-async function buildOriginalMesh() {
+// Build the source-side SplatMesh by handing the raw .spz bytes for slot A
+// to Spark's native loader. We then mark the mesh editable and attach the
+// SDF clip so only the source-side half of the splat shows in the preview.
+async function buildOriginalMesh(spzBytes) {
   disposeOriginalMeshes();
-  if (!packedA) return;
-  originalMesh = new SplatMesh({ packedSplats: packedA });
+  if (!spzBytes) return;
+  originalMesh = await buildSplatMeshFromSpzBytes(spzBytes);
   originalMesh.editable = true;
   originalMesh.edits = [originalClipEdit];
-  await originalMesh.initialized;
   splatGroupA.add(originalMesh);
 }
 
-// Build / rebuild the mirror mesh from whichever pre-reflected pack is active.
+// Build the mirror-side SplatMesh from the active pre-reflected .spz bytes.
+// The mesh's matrix is driven manually each frame by updateMirrorTransform().
 async function buildMirrorMesh() {
   disposeMirrorMeshes();
-  const src = activeMirrorPacked();
-  if (!src) return;
-  mirrorMesh = new SplatMesh({ packedSplats: src });
+  const bytes = activeMirrorBytes();
+  if (!bytes) return;
+  mirrorMesh = await buildSplatMeshFromSpzBytes(bytes);
   mirrorMesh.editable = true;
   mirrorMesh.edits = [mirrorClipEdit];
-  mirrorMesh.matrixAutoUpdate = false; // we drive .matrix manually
-  await mirrorMesh.initialized;
+  mirrorMesh.matrixAutoUpdate = false;
   scene.add(mirrorMesh);
 }
 
@@ -542,49 +532,46 @@ async function loadSpzIntoSlot(slot, bytes, fileName) {
   ui.setStatus(`Decoding ${fileName}…`);
   ui.enableDownload(false);
 
+  // We still decode the .spz once on our side so we can do the mirror math
+  // and write an export at the end. But the bytes that actually feed the
+  // renderer are passed straight to Spark's native loader — no per-splat
+  // re-quantization through setPackedSplat.
   const decoded = decodeSpz(bytes);
 
   if (slot === "a") {
     splatA = decoded;
     fileNameA = fileName;
 
-    // Disposing meshes BEFORE freeing the packed buffers they referenced
     disposeOriginalMeshes();
     disposeMirrorMeshes();
-    if (packedA) {
-      packedA.dispose?.();
-      packedA = null;
-    }
-    if (mirrorPackedA) {
-      mirrorPackedA.dispose?.();
-      mirrorPackedA = null;
-    }
+    mirrorBytesA = null;
 
     ui.setStatus(
       `Building meshes (${decoded.numPoints.toLocaleString()} splats from A)…`,
     );
-    packedA = await packFromData(decoded);
-    mirrorPackedA = await packFromData(mirrorAllSplats(decoded, 0, 0));
 
-    await buildOriginalMesh();
+    // The source-side mesh loads straight from the original .spz bytes.
+    await buildOriginalMesh(bytes);
+
+    // The mirror-side mesh uses a re-encoded copy of the data with every
+    // splat already pre-reflected across local X. Encoding back to .spz
+    // and going through Spark's native loader keeps the rendering quality
+    // identical to the source mesh.
+    mirrorBytesA = encodeSpz(mirrorAllSplats(decoded, 0, 0));
     await buildMirrorMesh();
+
     fitPlaneBoundsFromData(splatA);
   } else {
-    const isFirstB = splatB == null;
     splatB = decoded;
     fileNameB = fileName;
 
-    // Mirror mesh + radial mirrors will be rebuilt; dispose first
     disposeMirrorMeshes();
-    if (mirrorPackedB) {
-      mirrorPackedB.dispose?.();
-      mirrorPackedB = null;
-    }
+    mirrorBytesB = null;
 
     ui.setStatus(
       `Building mirror-side mesh (${decoded.numPoints.toLocaleString()} splats from B)…`,
     );
-    mirrorPackedB = await packFromData(mirrorAllSplats(decoded, 0, 0));
+    mirrorBytesB = encodeSpz(mirrorAllSplats(decoded, 0, 0));
     await buildMirrorMesh();
 
     // First-time slot-B load: splatGroupB has been auto-synced to A's
@@ -592,7 +579,7 @@ async function loadSpzIntoSlot(slot, bytes, fileName) {
     // already at the right "mirror of A" position. Nothing extra to do.
   }
 
-  applyUIState(ui.state); // re-apply (recreates radial copies referencing new packs)
+  applyUIState(ui.state); // re-apply (rebuilds radial copies on the new meshes)
   updateMirrorTransform();
   ui.setSlotName("a", splatA ? fileNameA : null);
   ui.setSlotName("b", splatB ? fileNameB : null);
@@ -610,15 +597,8 @@ async function clearSlot(slot) {
     fileNameA = "splat.spz";
     disposeOriginalMeshes();
     disposeMirrorMeshes();
-    if (packedA) {
-      packedA.dispose?.();
-      packedA = null;
-    }
-    if (mirrorPackedA) {
-      mirrorPackedA.dispose?.();
-      mirrorPackedA = null;
-    }
-    // Slot B's pre-reflected buffer is still valid, but with no A there's
+    mirrorBytesA = null;
+    // Slot B's pre-reflected bytes are still valid, but with no A there's
     // nothing to anchor the mirror to. Keep B's data around so it reappears
     // when the user reloads A.
     ui.enableDownload(false);
@@ -627,10 +607,7 @@ async function clearSlot(slot) {
     splatB = null;
     fileNameB = null;
     disposeMirrorMeshes();
-    if (mirrorPackedB) {
-      mirrorPackedB.dispose?.();
-      mirrorPackedB = null;
-    }
+    mirrorBytesB = null;
     // Mirror reverts to A's twin
     await buildMirrorMesh();
     applyUIState(ui.state);
@@ -850,7 +827,7 @@ async function handleDownload() {
         keepSourceSide(worldA, axisIdx, ui.state.plane, ui.state.flipSide),
       );
 
-      // B: clone, pre-X-flip (matches mirrorPackedB in the live preview),
+      // B: clone, pre-X-flip (matches mirrorBytesB in the live preview),
       // apply T_B, keep mirror side. Falls back to A's data when B is empty.
       const worldB = mirrorAllSplats(splatForMirror, 0, 0);
       applyTransform(
