@@ -278,6 +278,78 @@ export function buildMirroredSplat(splat, axis, d, flipSide = false) {
   return out;
 }
 
+/**
+ * Allocate a fresh splat-data object with the same schema as `like` but with
+ * room for `count` points. Helper for the slice/clip helpers below.
+ */
+function allocLike(like, count) {
+  const hasSh = like.sh != null && like.shCoeffsPerPoint > 0;
+  return {
+    version: like.version,
+    numPoints: count,
+    shDegree: like.shDegree,
+    fractionalBits: like.fractionalBits,
+    antialiased: like.antialiased,
+    positions: new Float32Array(count * 3),
+    alphas: new Float32Array(count),
+    rawColors: like.rawColors ? new Uint8Array(count * 3) : null,
+    colors: new Float32Array(count * 3),
+    scales: new Float32Array(count * 3),
+    rotations: new Float32Array(count * 4),
+    sh: hasSh ? new Float32Array(count * like.shCoeffsPerPoint) : null,
+    shCoeffsPerPoint: like.shCoeffsPerPoint,
+  };
+}
+
+/**
+ * Copy only the source-side splats of `splat` into a new splat. Used by the
+ * two-slot download to get "splat A's source half" without also producing
+ * mirrored twins.
+ */
+export function keepSourceSide(splat, axis, d, flipSide = false) {
+  let count = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (isOnSourceSide(splat, i, axis, d, flipSide)) count++;
+  }
+  const out = allocLike(splat, count);
+  let w = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (!isOnSourceSide(splat, i, axis, d, flipSide)) continue;
+    copySplat(splat, i, out, w);
+    w++;
+  }
+  return out;
+}
+
+/**
+ * Keep only the mirror-side splats. Used by the two-slot download when B has
+ * its own world transform (no reflection needed) — we just clip B's world-space
+ * positions to whichever side is the mirror side of the plane.
+ */
+export function keepMirrorSide(splat, axis, d, flipSide = false) {
+  return keepSourceSide(splat, axis, d, !flipSide);
+}
+
+/**
+ * Take only the splats that lie on the source side of the plane, and reflect
+ * THEM to the mirror side. Used by the two-slot download to mirror B's
+ * (or A's, if B is missing) source-side half across the plane.
+ */
+export function reflectAllSourceSide(splat, axis, d, flipSide = false) {
+  let count = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (isOnSourceSide(splat, i, axis, d, flipSide)) count++;
+  }
+  const out = allocLike(splat, count);
+  let w = 0;
+  for (let i = 0; i < splat.numPoints; i++) {
+    if (!isOnSourceSide(splat, i, axis, d, flipSide)) continue;
+    reflectSplat(splat, i, out, w, axis, d);
+    w++;
+  }
+  return out;
+}
+
 function copySplat(splat, i, out, j) {
   const i3 = i * 3,
     j3 = j * 3,
@@ -362,15 +434,22 @@ export function concatSplats(parts) {
 /**
  * Apply a 4x4 transform (THREE.Matrix4 elements) to every position in-place.
  * Also rotates each quaternion by the rotational component of the transform.
- * Note: this assumes the transform is a rigid-body transform (rotation + translation, no scale).
+ *
+ * If the matrix contains a uniform scale, supply it via `uniformScale`. The
+ * splat's positions are pre-scaled and the per-splat std-devs (`splat.scales`)
+ * are multiplied by `uniformScale` so the rendered ellipsoids match.
+ *
+ * For non-uniform scale, pass the average — this gives a reasonable
+ * approximation in the downloaded .spz even though the live preview is exact.
  *
  * @param {object} splat  decoded splat
  * @param {number[]} m16  4x4 matrix in column-major (THREE.Matrix4.elements format)
  * @param {Float32Array} [outQuat]  optional rotation as quaternion (x,y,z,w) — if supplied,
  *                                  used directly for rotating splat quaternions (faster than
  *                                  extracting from m16). Translation is taken from m16.
+ * @param {number} [uniformScale]  uniform scale factor to apply (default 1).
  */
-export function applyTransform(splat, m16, outQuat) {
+export function applyTransform(splat, m16, outQuat, uniformScale = 1) {
   // Extract translation
   const tx = m16[12],
     ty = m16[13],
@@ -412,13 +491,14 @@ export function applyTransform(splat, m16, outQuat) {
     }
   }
 
-  // Apply to every position: p' = R * p + t
+  // Apply to every position: p' = R * (S * p) + t
   const n = splat.numPoints;
+  const s = uniformScale;
   for (let i = 0; i < n; i++) {
     const i3 = i * 3;
-    const px = splat.positions[i3 + 0];
-    const py = splat.positions[i3 + 1];
-    const pz = splat.positions[i3 + 2];
+    const px = splat.positions[i3 + 0] * s;
+    const py = splat.positions[i3 + 1] * s;
+    const pz = splat.positions[i3 + 2] * s;
     // Rotate by quaternion (rx,ry,rz,rw)
     // v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
     const cx = ry * pz - rz * py;
@@ -444,5 +524,16 @@ export function applyTransform(splat, m16, outQuat) {
     splat.rotations[i4 + 1] = rw * qy - rx * qz + ry * qw + rz * qx;
     splat.rotations[i4 + 2] = rw * qz + rx * qy - ry * qx + rz * qw;
     splat.rotations[i4 + 3] = rw * qw - rx * qx - ry * qy - rz * qz;
+  }
+
+  // Scale the splat std-devs uniformly to match the position scale (otherwise
+  // the downloaded ellipsoids would still be at original radius).
+  if (uniformScale !== 1) {
+    for (let i = 0; i < n; i++) {
+      const i3 = i * 3;
+      splat.scales[i3 + 0] *= uniformScale;
+      splat.scales[i3 + 1] *= uniformScale;
+      splat.scales[i3 + 2] *= uniformScale;
+    }
   }
 }

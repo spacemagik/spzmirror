@@ -12,6 +12,33 @@
     <!-- Top-left control panel -->
     <aside id="controls">
       <details class="accordion" open>
+        <summary>Splats</summary>
+        <div class="accordion-body">
+          <section class="group">
+            <label class="group-label">Slot A — source side</label>
+            <div class="slot">
+              <span class="slot-name" id="slot-a-name">not loaded</span>
+              <button id="slot-a-load" class="ghost">Load .spz</button>
+              <button id="slot-a-clear" class="ghost" title="Clear slot A">×</button>
+            </div>
+          </section>
+          <section class="group">
+            <label class="group-label">Slot B — mirror side</label>
+            <div class="slot">
+              <span class="slot-name" id="slot-b-name">not loaded</span>
+              <button id="slot-b-load" class="ghost">Load .spz</button>
+              <button id="slot-b-clear" class="ghost" title="Clear slot B">×</button>
+            </div>
+            <p class="hint">
+              Leave B empty to use A's mirror image. Load a different splat
+              here to replace the reflection with another object.
+            </p>
+          </section>
+          <input id="file-input" type="file" accept=".spz" hidden />
+        </div>
+      </details>
+
+      <details class="accordion" open>
         <summary>Splat Mirror</summary>
         <div class="accordion-body">
           <section class="group">
@@ -63,7 +90,12 @@
             <div class="axis-buttons" role="radiogroup" aria-label="Gizmo mode">
               <button class="mode-btn active" data-mode="translate">Move</button>
               <button class="mode-btn" data-mode="rotate">Rotate</button>
+              <button class="mode-btn" data-mode="scale">Scale</button>
               <button class="mode-btn" data-mode="off">Off</button>
+            </div>
+            <div class="axis-buttons target-buttons" role="radiogroup" aria-label="Edit target">
+              <button class="target-btn active" data-target="a">Edit A</button>
+              <button class="target-btn" data-target="b" disabled>Edit B</button>
             </div>
             <button id="reset-splat" class="ghost full">Reset splat transform</button>
           </section>
@@ -129,9 +161,20 @@
       Download mirrored .spz
     </button>
 
-    <!-- Drag overlay -->
+    <!-- Drag overlay: split into two halves, drop position picks the slot -->
     <div id="drop-overlay">
-      <div class="drop-card">Drop .spz to load</div>
+      <div class="drop-half" data-slot="a">
+        <div class="drop-card">
+          <span class="drop-title">Slot A</span>
+          <span class="drop-sub">source side</span>
+        </div>
+      </div>
+      <div class="drop-half" data-slot="b">
+        <div class="drop-card">
+          <span class="drop-title">Slot B</span>
+          <span class="drop-sub">mirror side</span>
+        </div>
+      </div>
     </div>
 
     <!-- Import map for ESM dependencies -->
