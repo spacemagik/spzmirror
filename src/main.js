@@ -1779,4 +1779,7 @@ renderer.setAnimationLoop(() => {
 });
 
 // ----- Boot -----
-ui.setStatus("Drag a .spz file onto the window to get started.");
+loadSpzFromUrl("./mystical-forest.spz").catch((err) => {
+  console.error(err);
+  ui.setStatus("Drag a .spz file onto the window to get started.", true);
+});

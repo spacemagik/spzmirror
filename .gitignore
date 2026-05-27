@@ -13,8 +13,6 @@ dist/
 .vite/
 *.log
 
-# .spz outputs/extras. The original Dreamlike Room .spz is already tracked
-# by the initial commit, so this rule only blocks NEW .spz files (test
-# exports, additional splats you drop in, etc.) — already-tracked files
-# stay tracked.
+# Block .spz files everywhere except the default splat in public/
 *.spz
+!public/*.spz
