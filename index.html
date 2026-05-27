@@ -4,7 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Splat Mirror</title>
-    <link rel="stylesheet" href="/src/styles.css" />
+    <!-- Must be first: registers the service worker that stamps COOP/COEP
+         headers on every response so SharedArrayBuffer is available on
+         GitHub Pages (and any other host without custom header support). -->
+    <script src="./coi-serviceworker.js"></script>
+    <link rel="stylesheet" href="./src/styles.css" />
   </head>
   <body>
     <canvas id="viewport"></canvas>

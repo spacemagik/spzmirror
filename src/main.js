@@ -1779,7 +1779,4 @@ renderer.setAnimationLoop(() => {
 });
 
 // ----- Boot -----
-loadSpzFromUrl("/Dreamlike%20Room%20Filled%20with%20Clouds.spz").catch((err) => {
-  console.error(err);
-  ui.setStatus("Drag a .spz file onto the window to start", true);
-});
+ui.setStatus("Drag a .spz file onto the window to get started.");
